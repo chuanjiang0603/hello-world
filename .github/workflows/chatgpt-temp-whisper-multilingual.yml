@@ -1,0 +1,22 @@
+name: Temporary multilingual Whisper model transfer
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-whisper-multilingual-20260812
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download multilingual small model
+        run: |
+          curl -L --fail --retry 3 -o ggml-small-q5_1.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin
+          test -s ggml-small-q5_1.bin
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-model-small-multilingual-q5-1
+          path: ggml-small-q5_1.bin
+          retention-days: 1
