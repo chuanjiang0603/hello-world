@@ -1,0 +1,22 @@
+name: Temporary VAD model transfer
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-vad-model-20260812
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Silero VAD model
+        run: |
+          curl -L --fail --retry 3 -o ggml-silero-v5.1.2.bin \
+            https://raw.githubusercontent.com/Starmel/OpenSuperWhisper/master/OpenSuperWhisper/ggml-silero-v5.1.2.bin
+          test -s ggml-silero-v5.1.2.bin
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vad-silero-v5-1-2
+          path: ggml-silero-v5.1.2.bin
+          retention-days: 1
