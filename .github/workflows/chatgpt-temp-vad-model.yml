@@ -20,3 +20,5 @@ jobs:
           name: whisper-vad-silero-v5-1-2
           path: ggml-silero-v5.1.2.bin
           retention-days: 1
+
+# Trigger update
