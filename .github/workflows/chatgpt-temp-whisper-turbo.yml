@@ -1,0 +1,22 @@
+name: Temporary Whisper turbo model transfer
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-whisper-turbo-20260813
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download large-v3-turbo q5 model
+        run: |
+          curl -L --fail --retry 3 -o ggml-large-v3-turbo-q5_0.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+          test -s ggml-large-v3-turbo-q5_0.bin
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-model-large-v3-turbo-q5-0
+          path: ggml-large-v3-turbo-q5_0.bin
+          retention-days: 1
