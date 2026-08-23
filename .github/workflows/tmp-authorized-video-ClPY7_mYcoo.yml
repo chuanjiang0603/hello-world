@@ -68,19 +68,23 @@ jobs:
             return "$status"
           }
 
-          if ! download_attempt default; then
+          cleanup_partial() {
             rm -f work/source.* work/*.part work/*.ytdl
+          }
+
+          if ! download_attempt default; then
+            cleanup_partial
             if ! download_attempt web-safari --extractor-args 'youtube:player_client=web_safari'; then
-              rm -f work/source.* work/*.part work/*.ytdl
+              cleanup_partial
               if ! download_attempt android-vr --extractor-args 'youtube:player_client=android_vr'; then
-                rm -f work/source.* work/*.part work/*.ytdl
+                cleanup_partial
                 download_attempt multi-client --extractor-args 'youtube:player_client=web_safari,android_vr,web'
               fi
             fi
           fi
 
           SOURCE="$(find work -maxdepth 1 -type f \
-            ! -name '*.json' ! -name '*.log' ! -name '*.part' ! -name '*.ytdl' \
+            \( -name 'source.mp4' -o -name 'source.mkv' -o -name 'source.webm' -o -name 'source.m4v' \) \
             -printf '%p\n' | head -n 1)"
           [[ -n "$SOURCE" && -s "$SOURCE" ]]
 
@@ -99,16 +103,7 @@ jobs:
               -map 0:v:0 -map 0:a:0 -c copy -movflags +faststart "$OUT"
             MODE='lossless remux of the selected YouTube AVC/AAC stream'
           else
-            read -r VIDEO_BPS MAXRATE BUFSIZE < <(python3 - "$DURATION" "$TARGET_BYTES" <<'PY'
-import sys
-seconds = float(sys.argv[1])
-target_bytes = int(sys.argv[2])
-audio_bps = 96_000
-total_bps = int(target_bytes * 8 * 0.965 / seconds)
-video_bps = max(650_000, total_bps - audio_bps)
-print(video_bps, int(video_bps * 1.15), int(video_bps * 2.3))
-PY
-)
+            read -r VIDEO_BPS MAXRATE BUFSIZE <<< "$(python3 -c 'import sys; seconds=float(sys.argv[1]); target=int(sys.argv[2]); total=int(target*8*0.965/seconds); video=max(650000,total-96000); print(video,int(video*1.15),int(video*2.3))' "$DURATION" "$TARGET_BYTES")"
             FILTER="scale='min(1280,iw)':-2:flags=lanczos,format=yuv420p"
             ffmpeg -hide_banner -loglevel warning -y -i "$SOURCE" \
               -map 0:v:0 -vf "$FILTER" -c:v libx264 -preset medium \
@@ -130,16 +125,7 @@ PY
           OUT_HEIGHT="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$OUT")"
           OUT_VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$OUT")"
           OUT_ACODEC="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$OUT")"
-          TITLE="$(python3 - <<'PY'
-import glob, json
-files = glob.glob('work/*.info.json')
-if not files:
-    print('Unknown')
-else:
-    with open(files[0], encoding='utf-8') as f:
-        print(json.load(f).get('title', 'Unknown'))
-PY
-)"
+          TITLE="$(python3 -c 'import glob,json; f=glob.glob("work/*.info.json"); print(json.load(open(f[0],encoding="utf-8")).get("title","Unknown") if f else "Unknown")')"
 
           {
             echo "Video ID: ClPY7_mYcoo"
@@ -150,8 +136,8 @@ PY
             echo "Full decode verification: PASS"
           } | tee output/verification.txt
 
-          cp work/download.log output/download.log
-          cp work/formats.log output/formats.log
+          cp work/download.log output/download.log 2>/dev/null || true
+          cp work/formats.log output/formats.log 2>/dev/null || true
           cp work/*.info.json output/ 2>/dev/null || true
 
       - name: Upload temporary transfer artifact
