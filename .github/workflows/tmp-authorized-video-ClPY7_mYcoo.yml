@@ -16,30 +16,176 @@ jobs:
       - name: Check out temporary branch content
         uses: actions/checkout@v4
 
-      - name: Install media tools
+      - name: Install current downloader and media tools
         shell: bash
         run: |
           set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --upgrade --pre "yt-dlp[default]"
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y ffmpeg
           fi
+          yt-dlp --version
           ffmpeg -version | head -n 1
-          python3 --version
-          curl --version | head -n 1
+          node --version
+          docker --version
 
-      - name: Fetch the authorized 720p source through public media bridges
+      - name: Start a temporary Cloudflare WARP proxy
         shell: bash
         run: |
           set -euo pipefail
+          IMAGE='ghcr.io/callacat/warp-go:latest'
+          mkdir -p warp-config work output
+          sudo chown -R 1001:1001 warp-config
+          docker pull "$IMAGE"
+          docker run --rm \
+            -v "$PWD/warp-config:/data/config" \
+            "$IMAGE" -reg
+
+          cat > warp-config/rules.txt <<'EOF'
+          proxy,domain:youtube.com
+          proxy,domain:youtu.be
+          proxy,domain:googlevideo.com
+          proxy,domain:google.com
+          proxy,domain:ytimg.com
+          proxy,domain:gstatic.com
+          proxy,domain:ggpht.com
+          proxy,domain:googleapis.com
+          proxy,domain:cloudflare.com
+          proxy,domain:invidious.tiekoetter.com
+          proxy,domain:chocolatemoo53.com
+          proxy,domain:nadeko.net
+          proxy,domain:f5.si
+          proxy,domain:nerdvpn.de
+          proxy,domain:kavin.rocks
+          proxy,domain:tokhmi.xyz
+          proxy,domain:moomoo.me
+          proxy,domain:syncpundit.io
+          proxy,domain:mha.fi
+          proxy,domain:garudalinux.org
+          proxy,domain:rivo.lol
+          proxy,domain:leptons.xyz
+          EOF
+
+          cat > warp-config/config.json <<'EOF'
+          {
+            "listen_addr": "0.0.0.0:40000",
+            "rules_path": "/data/config/rules.txt",
+            "geo_dir": "/data/config/geo",
+            "geo_repo": "https://github.com/MetaCubeX/meta-rules-dat",
+            "geo_auto_update_days": 0,
+            "enable_system_proxy": false,
+            "allow_udp": false,
+            "download_proxy": "",
+            "dial_timeout_seconds": 60
+          }
+          EOF
+          sudo chown -R 1001:1001 warp-config
+
+          docker run -d --name temporary-warp \
+            -v "$PWD/warp-config:/data/config" \
+            -p 127.0.0.1:40000:40000 \
+            "$IMAGE" -config /data/config/config.json -l 0.0.0.0:40000
+
+          : > work/warp-trace.txt
+          ready=0
+          for attempt in $(seq 1 30); do
+            trace="$(curl --silent --show-error --max-time 12 \
+              --socks5-hostname 127.0.0.1:40000 \
+              https://www.cloudflare.com/cdn-cgi/trace 2>&1 || true)"
+            {
+              echo "=== attempt $attempt ==="
+              echo "$trace"
+            } | tee -a work/warp-trace.txt
+            if grep -q '^warp=on$' <<< "$trace"; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          docker logs temporary-warp --tail 200 > work/warp-container.log 2>&1 || true
+          cp work/warp-trace.txt output/
+          [[ $ready -eq 1 ]]
+
+      - name: Download the authorized 720p video through WARP
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://www.youtube.com/watch?v=ClPY7_mYcoo'
+          PROXY='socks5h://127.0.0.1:40000'
+          FORMAT='bv*[height<=720][ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a]/22/18/b[height<=720][ext=mp4]'
           mkdir -p work output
-          set +e
-          python3 tmp_authorized_video/media_fallback.py 2>&1 | tee work/bridge.log
-          status=${PIPESTATUS[0]}
-          set -e
-          cp work/bridge.log output/bridge.log
+
+          COMMON=(
+            --proxy "$PROXY"
+            --no-playlist
+            --newline
+            --retries 10
+            --fragment-retries 10
+            --retry-sleep 2
+            --sleep-requests 1
+            --write-info-json
+          )
+          if yt-dlp --help | grep -q -- '--js-runtimes'; then
+            COMMON+=(--js-runtimes node)
+          fi
+          if yt-dlp --help | grep -q -- '--remote-components'; then
+            COMMON+=(--remote-components ejs:github)
+          fi
+          if yt-dlp --help | grep -q -- '--impersonate'; then
+            COMMON+=(--impersonate chrome)
+          fi
+
+          download_attempt() {
+            local label="$1"
+            shift
+            echo "=== Attempt: $label ===" | tee -a work/download.log
+            set +e
+            yt-dlp "${COMMON[@]}" "$@" -f "$FORMAT" --merge-output-format mp4 \
+              -o 'work/source.%(ext)s' "$URL" 2>&1 | tee -a work/download.log
+            local status=${PIPESTATUS[0]}
+            set -e
+            return "$status"
+          }
+
+          cleanup_partial() {
+            rm -f work/source.* work/*.part work/*.ytdl
+          }
+
+          success=0
+          if download_attempt default; then success=1; fi
+          if [[ $success -eq 0 ]]; then
+            cleanup_partial
+            if download_attempt web-safari --extractor-args 'youtube:player_client=web_safari'; then success=1; fi
+          fi
+          if [[ $success -eq 0 ]]; then
+            cleanup_partial
+            if download_attempt android-vr --extractor-args 'youtube:player_client=android_vr'; then success=1; fi
+          fi
+          if [[ $success -eq 0 ]]; then
+            cleanup_partial
+            if download_attempt multi-client --extractor-args 'youtube:player_client=web_safari,android_vr,web'; then success=1; fi
+          fi
+
+          if [[ $success -eq 0 ]]; then
+            cleanup_partial
+            echo 'Direct YouTube extraction failed; retrying public bridge APIs through WARP.' | tee -a work/download.log
+            set +e
+            HTTP_PROXY='http://127.0.0.1:40000' \
+            HTTPS_PROXY='http://127.0.0.1:40000' \
+            ALL_PROXY='socks5h://127.0.0.1:40000' \
+            NO_PROXY='127.0.0.1,localhost' \
+              python3 tmp_authorized_video/media_fallback.py 2>&1 | tee -a work/download.log
+            status=${PIPESTATUS[0]}
+            set -e
+            if [[ $status -eq 0 ]]; then success=1; fi
+          fi
+
+          cp work/download.log output/download.log
+          cp work/*.info.json output/ 2>/dev/null || true
           cp work/bridge.info.json output/ 2>/dev/null || true
-          [[ $status -eq 0 ]]
+          [[ $success -eq 1 ]]
           [[ -s work/source.mp4 ]]
 
       - name: Produce a WeChat-compatible MP4 and verify the complete stream
@@ -86,7 +232,7 @@ jobs:
           OUT_HEIGHT="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$OUT")"
           OUT_VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$OUT")"
           OUT_ACODEC="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$OUT")"
-          TITLE="$(python3 -c 'import json; p="work/bridge.info.json"; d=json.load(open(p,encoding="utf-8")); print(d.get("title") or d.get("name") or "Unknown")' 2>/dev/null || echo Unknown)"
+          TITLE="$(python3 -c 'import glob,json; f=glob.glob("work/*.info.json"); print(json.load(open(f[0],encoding="utf-8")).get("title","Unknown") if f else "Unknown")' 2>/dev/null || echo Unknown)"
           SHA256="$(sha256sum "$OUT" | awk '{print $1}')"
 
           {
@@ -110,3 +256,10 @@ jobs:
           if-no-files-found: warn
           compression-level: 0
           retention-days: 1
+
+      - name: Stop temporary WARP proxy
+        if: always()
+        shell: bash
+        run: |
+          docker logs temporary-warp --tail 200 > /tmp/temporary-warp.log 2>&1 || true
+          docker rm -f temporary-warp >/dev/null 2>&1 || true
