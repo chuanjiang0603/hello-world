@@ -1,0 +1,154 @@
+name: Temporary authorized video transfer
+
+on:
+  push:
+    branches:
+      - tmp-authorized-video-ClPY7_mYcoo-20260823
+
+permissions:
+  contents: read
+
+jobs:
+  download-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Install current downloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --upgrade --pre "yt-dlp[default]"
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          yt-dlp --version
+          ffmpeg -version | head -n 1
+          node --version
+
+      - name: Download authorized video and make WeChat-compatible MP4
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://www.youtube.com/watch?v=ClPY7_mYcoo'
+          mkdir -p work output
+
+          COMMON=(
+            --no-playlist
+            --newline
+            --retries 10
+            --fragment-retries 10
+            --retry-sleep 2
+            --sleep-requests 1
+            --write-info-json
+          )
+          if yt-dlp --help | grep -q -- '--js-runtimes'; then
+            COMMON+=(--js-runtimes node)
+          fi
+          if yt-dlp --help | grep -q -- '--remote-components'; then
+            COMMON+=(--remote-components ejs:github)
+          fi
+
+          FORMAT='bv[height<=720][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=720][ext=mp4]/bv[height<=720]+ba/b[height<=720]'
+
+          set +e
+          yt-dlp "${COMMON[@]}" -f "$FORMAT" --merge-output-format mp4 \
+            -o 'work/source.%(ext)s' "$URL" 2>&1 | tee work/download.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ $status -ne 0 ]]; then
+            rm -f work/source.* work/*.part work/*.ytdl
+            set +e
+            yt-dlp "${COMMON[@]}" \
+              --extractor-args 'youtube:player_client=web_safari,android_vr' \
+              -f "$FORMAT" --merge-output-format mp4 \
+              -o 'work/source.%(ext)s' "$URL" 2>&1 | tee -a work/download.log
+            status=${PIPESTATUS[0]}
+            set -e
+          fi
+          [[ $status -eq 0 ]]
+
+          SOURCE="$(find work -maxdepth 1 -type f \
+            ! -name '*.json' ! -name '*.log' ! -name '*.part' ! -name '*.ytdl' \
+            -printf '%p\n' | head -n 1)"
+          [[ -n "$SOURCE" && -s "$SOURCE" ]]
+
+          DURATION="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$SOURCE")"
+          WIDTH="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$SOURCE")"
+          HEIGHT="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$SOURCE")"
+          VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$SOURCE")"
+          ACODEC="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$SOURCE")"
+          SOURCE_SIZE="$(stat -c '%s' "$SOURCE")"
+          LIMIT_BYTES=$((190 * 1024 * 1024))
+          TARGET_BYTES=$((182 * 1024 * 1024))
+          OUT='output/Abbott_CGM_Usage_WeChat_720p.mp4'
+
+          if [[ "$VCODEC" == 'h264' && "$ACODEC" == 'aac' && "$SOURCE_SIZE" -le "$LIMIT_BYTES" && "$WIDTH" -le 1280 && "$HEIGHT" -le 720 ]]; then
+            ffmpeg -hide_banner -loglevel warning -y -i "$SOURCE" \
+              -map 0:v:0 -map 0:a:0 -c copy -movflags +faststart "$OUT"
+            MODE='lossless remux of YouTube 720p AVC/AAC stream'
+          else
+            read -r VIDEO_BPS MAXRATE BUFSIZE < <(python3 - "$DURATION" "$TARGET_BYTES" <<'PY'
+import sys
+seconds = float(sys.argv[1])
+target_bytes = int(sys.argv[2])
+audio_bps = 96_000
+total_bps = int(target_bytes * 8 * 0.965 / seconds)
+video_bps = max(650_000, total_bps - audio_bps)
+print(video_bps, int(video_bps * 1.15), int(video_bps * 2.3))
+PY
+)
+            FILTER="scale='min(1280,iw)':-2:flags=lanczos,format=yuv420p"
+            ffmpeg -hide_banner -loglevel warning -y -i "$SOURCE" \
+              -map 0:v:0 -vf "$FILTER" -c:v libx264 -preset medium \
+              -b:v "$VIDEO_BPS" -maxrate "$MAXRATE" -bufsize "$BUFSIZE" \
+              -pass 1 -passlogfile work/ffmpeg2pass -an -f mp4 /dev/null
+            ffmpeg -hide_banner -loglevel warning -y -i "$SOURCE" \
+              -map 0:v:0 -map 0:a:0 -vf "$FILTER" -c:v libx264 -preset medium \
+              -b:v "$VIDEO_BPS" -maxrate "$MAXRATE" -bufsize "$BUFSIZE" \
+              -pass 2 -passlogfile work/ffmpeg2pass \
+              -c:a aac -b:a 96k -ac 2 -ar 48000 \
+              -movflags +faststart "$OUT"
+            MODE="two-pass H.264/AAC encode targeting $TARGET_BYTES bytes"
+          fi
+
+          ffmpeg -v error -i "$OUT" -f null -
+          OUTPUT_SIZE="$(stat -c '%s' "$OUT")"
+          OUT_DURATION="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$OUT")"
+          OUT_WIDTH="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$OUT")"
+          OUT_HEIGHT="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$OUT")"
+          OUT_VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$OUT")"
+          OUT_ACODEC="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$OUT")"
+          TITLE="$(python3 - <<'PY'
+import glob, json
+files = glob.glob('work/*.info.json')
+if not files:
+    print('Unknown')
+else:
+    with open(files[0], encoding='utf-8') as f:
+        print(json.load(f).get('title', 'Unknown'))
+PY
+)"
+
+          {
+            echo "Video ID: ClPY7_mYcoo"
+            echo "Title: $TITLE"
+            echo "Processing: $MODE"
+            echo "Source: $WIDTH x $HEIGHT, video=$VCODEC, audio=$ACODEC, bytes=$SOURCE_SIZE, duration=$DURATION"
+            echo "Output: $OUT_WIDTH x $OUT_HEIGHT, video=$OUT_VCODEC, audio=$OUT_ACODEC, bytes=$OUTPUT_SIZE, duration=$OUT_DURATION"
+            echo "Full decode verification: PASS"
+          } | tee output/verification.txt
+
+          cp work/download.log output/download.log
+          cp work/*.info.json output/ 2>/dev/null || true
+
+      - name: Upload temporary transfer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: authorized-video-ClPY7_mYcoo-wechat
+          path: output/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
