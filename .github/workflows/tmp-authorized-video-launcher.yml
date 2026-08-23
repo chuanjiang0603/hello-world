@@ -1,0 +1,54 @@
+name: Temporary authorized video launcher
+
+on:
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+
+jobs:
+  run-authorized-video-script:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out pull-request merge commit
+        uses: actions/checkout@v4
+
+      - name: Extract the isolated branch's shell steps
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import pathlib
+          import yaml
+
+          workflow = pathlib.Path('.github/workflows/tmp-authorized-video-ClPY7_mYcoo.yml')
+          data = yaml.safe_load(workflow.read_text(encoding='utf-8'))
+          steps = data['jobs']['download-and-package']['steps']
+          shell_blocks = [step['run'] for step in steps if isinstance(step, dict) and step.get('run')]
+          if not shell_blocks:
+              raise SystemExit('No shell blocks found in isolated workflow')
+          pathlib.Path('/tmp/authorized-video.sh').write_text(
+              'set -euo pipefail\n\n' + '\n\n'.join(shell_blocks) + '\n',
+              encoding='utf-8',
+          )
+          PY
+          bash /tmp/authorized-video.sh
+
+      - name: Upload temporary transfer artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authorized-video-ClPY7_mYcoo-wechat
+          path: output/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 1
