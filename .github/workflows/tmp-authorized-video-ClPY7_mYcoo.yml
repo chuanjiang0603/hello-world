@@ -13,80 +13,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - name: Install downloader and verify media tools
+      - name: Install media tools
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install --upgrade --pre "yt-dlp[default]"
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y ffmpeg
           fi
-          yt-dlp --version
           ffmpeg -version | head -n 1
-          node --version
+          python3 --version
+          curl --version | head -n 1
 
-      - name: Download authorized video and build WeChat MP4
+      - name: Fetch the authorized 720p source through public media bridges
         shell: bash
         run: |
           set -euo pipefail
-          URL='https://www.youtube.com/watch?v=ClPY7_mYcoo'
           mkdir -p work output
-
-          COMMON=(
-            --no-playlist
-            --newline
-            --retries 10
-            --fragment-retries 10
-            --retry-sleep 2
-            --sleep-requests 1
-            --write-info-json
-          )
-          if yt-dlp --help | grep -q -- '--js-runtimes'; then
-            COMMON+=(--js-runtimes node)
-          fi
-          if yt-dlp --help | grep -q -- '--remote-components'; then
-            COMMON+=(--remote-components ejs:github)
-          fi
-
-          FORMAT='bv*[height<=720][vcodec^=avc1]+ba[acodec^=mp4a]/22/18/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]'
-
           set +e
-          yt-dlp "${COMMON[@]}" --list-formats "$URL" 2>&1 | tee work/formats.log
+          python3 tmp_authorized_video/media_fallback.py 2>&1 | tee work/bridge.log
+          status=${PIPESTATUS[0]}
           set -e
+          cp work/bridge.log output/bridge.log
+          cp work/bridge.info.json output/ 2>/dev/null || true
+          [[ $status -eq 0 ]]
+          [[ -s work/source.mp4 ]]
 
-          download_attempt() {
-            local label="$1"
-            shift
-            echo "=== Attempt: $label ===" | tee -a work/download.log
-            set +e
-            yt-dlp "${COMMON[@]}" "$@" -f "$FORMAT" --merge-output-format mp4 \
-              -o 'work/source.%(ext)s' "$URL" 2>&1 | tee -a work/download.log
-            local status=${PIPESTATUS[0]}
-            set -e
-            return "$status"
-          }
-
-          cleanup_partial() {
-            rm -f work/source.* work/*.part work/*.ytdl
-          }
-
-          if ! download_attempt default; then
-            cleanup_partial
-            if ! download_attempt web-safari --extractor-args 'youtube:player_client=web_safari'; then
-              cleanup_partial
-              if ! download_attempt android-vr --extractor-args 'youtube:player_client=android_vr'; then
-                cleanup_partial
-                download_attempt multi-client --extractor-args 'youtube:player_client=web_safari,android_vr,web'
-              fi
-            fi
-          fi
-
-          SOURCE="$(find work -maxdepth 1 -type f \
-            \( -name 'source.mp4' -o -name 'source.mkv' -o -name 'source.webm' -o -name 'source.m4v' \) \
-            -printf '%p\n' | head -n 1)"
-          [[ -n "$SOURCE" && -s "$SOURCE" ]]
+      - name: Produce a WeChat-compatible MP4 and verify the complete stream
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE='work/source.mp4'
+          OUT='output/Abbott_CGM_Usage_WeChat_720p.mp4'
+          LIMIT_BYTES=$((190 * 1024 * 1024))
+          TARGET_BYTES=$((182 * 1024 * 1024))
 
           DURATION="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$SOURCE")"
           WIDTH="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$SOURCE")"
@@ -94,14 +54,11 @@ jobs:
           VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$SOURCE")"
           ACODEC="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$SOURCE")"
           SOURCE_SIZE="$(stat -c '%s' "$SOURCE")"
-          LIMIT_BYTES=$((190 * 1024 * 1024))
-          TARGET_BYTES=$((182 * 1024 * 1024))
-          OUT='output/Abbott_CGM_Usage_WeChat_720p.mp4'
 
           if [[ "$VCODEC" == 'h264' && "$ACODEC" == 'aac' && "$SOURCE_SIZE" -le "$LIMIT_BYTES" && "$WIDTH" -le 1280 && "$HEIGHT" -le 720 ]]; then
             ffmpeg -hide_banner -loglevel warning -y -i "$SOURCE" \
               -map 0:v:0 -map 0:a:0 -c copy -movflags +faststart "$OUT"
-            MODE='lossless remux of the selected YouTube AVC/AAC stream'
+            MODE='lossless remux of the selected 720p H.264/AAC stream'
           else
             read -r VIDEO_BPS MAXRATE BUFSIZE <<< "$(python3 -c 'import sys; seconds=float(sys.argv[1]); target=int(sys.argv[2]); total=int(target*8*0.965/seconds); video=max(650000,total-96000); print(video,int(video*1.15),int(video*2.3))' "$DURATION" "$TARGET_BYTES")"
             FILTER="scale='min(1280,iw)':-2:flags=lanczos,format=yuv420p"
@@ -119,26 +76,27 @@ jobs:
           fi
 
           ffmpeg -v error -i "$OUT" -f null -
+
           OUTPUT_SIZE="$(stat -c '%s' "$OUT")"
           OUT_DURATION="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$OUT")"
           OUT_WIDTH="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$OUT")"
           OUT_HEIGHT="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$OUT")"
           OUT_VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$OUT")"
           OUT_ACODEC="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$OUT")"
-          TITLE="$(python3 -c 'import glob,json; f=glob.glob("work/*.info.json"); print(json.load(open(f[0],encoding="utf-8")).get("title","Unknown") if f else "Unknown")')"
+          TITLE="$(python3 -c 'import json; p="work/bridge.info.json"; d=json.load(open(p,encoding="utf-8")); print(d.get("title") or d.get("name") or "Unknown")' 2>/dev/null || echo Unknown)"
+          SHA256="$(sha256sum "$OUT" | awk '{print $1}')"
 
           {
             echo "Video ID: ClPY7_mYcoo"
             echo "Title: $TITLE"
             echo "Processing: $MODE"
-            echo "Source: $WIDTH x $HEIGHT, video=$VCODEC, audio=$ACODEC, bytes=$SOURCE_SIZE, duration=$DURATION"
-            echo "Output: $OUT_WIDTH x $OUT_HEIGHT, video=$OUT_VCODEC, audio=$OUT_ACODEC, bytes=$OUTPUT_SIZE, duration=$OUT_DURATION"
+            echo "Source: ${WIDTH}x${HEIGHT}, video=$VCODEC, audio=$ACODEC, bytes=$SOURCE_SIZE, duration=$DURATION"
+            echo "Output: ${OUT_WIDTH}x${OUT_HEIGHT}, video=$OUT_VCODEC, audio=$OUT_ACODEC, bytes=$OUTPUT_SIZE, duration=$OUT_DURATION"
+            echo "SHA-256: $SHA256"
             echo "Full decode verification: PASS"
           } | tee output/verification.txt
 
-          cp work/download.log output/download.log 2>/dev/null || true
-          cp work/formats.log output/formats.log 2>/dev/null || true
-          cp work/*.info.json output/ 2>/dev/null || true
+          ffprobe -v error -show_format -show_streams -of json "$OUT" > output/ffprobe.json
 
       - name: Upload temporary transfer artifact
         if: always()
