@@ -1,0 +1,202 @@
+name: Temporary authorized video final
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-authorized-video-final-ClPY7_mYcoo
+  cancel-in-progress: true
+
+jobs:
+  download-package-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+
+      - name: Download authorized video through WARP and package for WeChat
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work output warp-config
+          trap 'docker rm -f temporary-warp >/dev/null 2>&1 || true' EXIT
+
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --upgrade --pre "yt-dlp[default]"
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          yt-dlp --version | tee output/yt-dlp-version.txt
+          ffmpeg -version | head -n 1 | tee output/ffmpeg-version.txt
+
+          IMAGE='ghcr.io/callacat/warp-go:latest'
+          sudo chown -R 1001:1001 warp-config
+          docker pull "$IMAGE"
+          docker run --rm -v "$PWD/warp-config:/data/config" "$IMAGE" -reg
+
+          cat > warp-config/rules.txt <<'EOF'
+          proxy,domain:youtube.com
+          proxy,domain:youtu.be
+          proxy,domain:googlevideo.com
+          proxy,domain:google.com
+          proxy,domain:ytimg.com
+          proxy,domain:gstatic.com
+          proxy,domain:ggpht.com
+          proxy,domain:googleapis.com
+          proxy,domain:cloudflare.com
+          EOF
+
+          cat > warp-config/config.json <<'EOF'
+          {
+            "listen_addr": "0.0.0.0:40000",
+            "rules_path": "/data/config/rules.txt",
+            "geo_dir": "/data/config/geo",
+            "geo_repo": "https://github.com/MetaCubeX/meta-rules-dat",
+            "geo_auto_update_days": 0,
+            "enable_system_proxy": false,
+            "allow_udp": false,
+            "download_proxy": "",
+            "dial_timeout_seconds": 60
+          }
+          EOF
+          sudo chown -R 1001:1001 warp-config
+
+          docker run -d --name temporary-warp \
+            -v "$PWD/warp-config:/data/config" \
+            -p 127.0.0.1:40000:40000 \
+            "$IMAGE" -config /data/config/config.json -l 0.0.0.0:40000
+
+          ready=0
+          for attempt in $(seq 1 30); do
+            trace="$(curl --silent --show-error --max-time 12 \
+              --socks5-hostname 127.0.0.1:40000 \
+              https://www.cloudflare.com/cdn-cgi/trace 2>&1 || true)"
+            printf '%s\n' "$trace" > output/warp-trace.txt
+            if grep -q '^warp=on$' <<< "$trace"; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          [[ $ready -eq 1 ]]
+
+          URL='https://www.youtube.com/watch?v=ClPY7_mYcoo'
+          PROXY='socks5h://127.0.0.1:40000'
+          FORMAT='bv[height<=720][ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a]/22/18/b[height<=720][ext=mp4]'
+          COMMON=(
+            --proxy "$PROXY"
+            --no-playlist
+            --newline
+            --retries 10
+            --fragment-retries 10
+            --retry-sleep 2
+            --sleep-requests 1
+            --write-info-json
+            --js-runtimes node
+            --remote-components ejs:github
+          )
+
+          download_attempt() {
+            local label="$1"
+            shift
+            echo "=== Attempt: $label ===" | tee -a work/download.log
+            set +e
+            yt-dlp "${COMMON[@]}" "$@" -f "$FORMAT" \
+              --merge-output-format mp4 -o 'work/source.%(ext)s' "$URL" \
+              2>&1 | tee -a work/download.log
+            local status=${PIPESTATUS[0]}
+            set -e
+            return "$status"
+          }
+
+          cleanup_partial() {
+            rm -f work/source.* work/*.part work/*.ytdl
+          }
+
+          success=0
+          if download_attempt default; then success=1; fi
+          if [[ $success -eq 0 ]]; then
+            cleanup_partial
+            if download_attempt web-safari --extractor-args 'youtube:player_client=web_safari'; then success=1; fi
+          fi
+          if [[ $success -eq 0 ]]; then
+            cleanup_partial
+            if download_attempt android-vr --extractor-args 'youtube:player_client=android_vr'; then success=1; fi
+          fi
+          if [[ $success -eq 0 ]]; then
+            cleanup_partial
+            if download_attempt multi-client --extractor-args 'youtube:player_client=web_safari,android_vr,web'; then success=1; fi
+          fi
+
+          cp work/download.log output/download.log
+          cp work/*.info.json output/ 2>/dev/null || true
+          [[ $success -eq 1 ]]
+          SOURCE="$(find work -maxdepth 1 -type f -name 'source.mp4' -print -quit)"
+          [[ -n "$SOURCE" && -s "$SOURCE" ]]
+
+          DURATION="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$SOURCE")"
+          WIDTH="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$SOURCE")"
+          HEIGHT="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$SOURCE")"
+          VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$SOURCE")"
+          ACODEC="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$SOURCE")"
+          SOURCE_SIZE="$(stat -c '%s' "$SOURCE")"
+          LIMIT_BYTES=$((190 * 1024 * 1024))
+          TARGET_BYTES=$((182 * 1024 * 1024))
+          OUT='output/Abbott_CGM_Usage_WeChat_720p.mp4'
+
+          if [[ "$VCODEC" == 'h264' && "$ACODEC" == 'aac' && "$SOURCE_SIZE" -le "$LIMIT_BYTES" && "$WIDTH" -le 1280 && "$HEIGHT" -le 720 ]]; then
+            ffmpeg -hide_banner -loglevel warning -y -i "$SOURCE" \
+              -map 0:v:0 -map 0:a:0 -c copy -movflags +faststart "$OUT"
+            MODE='lossless remux of selected 720p H.264/AAC stream; no quality-reducing recompression'
+          else
+            read -r VIDEO_BPS MAXRATE BUFSIZE <<< "$(python3 -c 'import sys; s=float(sys.argv[1]); t=int(sys.argv[2]); total=int(t*8*0.965/s); v=max(650000,total-96000); print(v,int(v*1.15),int(v*2.3))' "$DURATION" "$TARGET_BYTES")"
+            FILTER="scale='min(1280,iw)':-2:flags=lanczos,format=yuv420p"
+            ffmpeg -hide_banner -loglevel warning -y -i "$SOURCE" \
+              -map 0:v:0 -vf "$FILTER" -c:v libx264 -preset medium \
+              -b:v "$VIDEO_BPS" -maxrate "$MAXRATE" -bufsize "$BUFSIZE" \
+              -pass 1 -passlogfile work/ffmpeg2pass -an -f mp4 /dev/null
+            ffmpeg -hide_banner -loglevel warning -y -i "$SOURCE" \
+              -map 0:v:0 -map 0:a:0 -vf "$FILTER" -c:v libx264 -preset medium \
+              -b:v "$VIDEO_BPS" -maxrate "$MAXRATE" -bufsize "$BUFSIZE" \
+              -pass 2 -passlogfile work/ffmpeg2pass \
+              -c:a aac -b:a 96k -ac 2 -ar 48000 -movflags +faststart "$OUT"
+            MODE='two-pass H.264/AAC encode targeting 182 MiB'
+          fi
+
+          ffmpeg -v error -i "$OUT" -f null -
+          OUTPUT_SIZE="$(stat -c '%s' "$OUT")"
+          OUT_DURATION="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$OUT")"
+          OUT_WIDTH="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nw=1:nk=1 "$OUT")"
+          OUT_HEIGHT="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nw=1:nk=1 "$OUT")"
+          OUT_VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$OUT")"
+          OUT_ACODEC="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$OUT")"
+          TITLE="$(python3 -c 'import glob,json; f=glob.glob("work/*.info.json"); print(json.load(open(f[0],encoding="utf-8")).get("title","Unknown") if f else "Unknown")')"
+          SHA256="$(sha256sum "$OUT" | awk '{print $1}')"
+
+          {
+            echo "Video ID: ClPY7_mYcoo"
+            echo "Title: $TITLE"
+            echo "Processing: $MODE"
+            echo "Source: ${WIDTH}x${HEIGHT}, video=$VCODEC, audio=$ACODEC, bytes=$SOURCE_SIZE, duration=$DURATION"
+            echo "Output: ${OUT_WIDTH}x${OUT_HEIGHT}, video=$OUT_VCODEC, audio=$OUT_ACODEC, bytes=$OUTPUT_SIZE, duration=$OUT_DURATION"
+            echo "SHA-256: $SHA256"
+            echo "Full decode verification: PASS"
+          } | tee output/verification.txt
+          ffprobe -v error -show_format -show_streams -of json "$OUT" > output/ffprobe.json
+
+      - name: Upload verified video
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authorized-video-ClPY7_mYcoo-final
+          path: output/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 1
