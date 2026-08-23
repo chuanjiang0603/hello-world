@@ -6,7 +6,7 @@ on:
       - tmp-authorized-video-ClPY7_mYcoo-20260823
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   download-and-package:
@@ -152,3 +152,41 @@ PY
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
+
+      - name: Record run identifier on temporary branch
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const path = 'tmp-authorized-video-ClPY7_mYcoo-result.json';
+            const branch = 'tmp-authorized-video-ClPY7_mYcoo-20260823';
+            let sha;
+            try {
+              const existing = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path,
+                ref: branch,
+              });
+              sha = existing.data.sha;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            const body = {
+              run_id: context.runId,
+              run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+              job_status: '${{ job.status }}',
+              head_sha: context.sha,
+              artifact_name: 'authorized-video-ClPY7_mYcoo-wechat',
+              recorded_at: new Date().toISOString(),
+            };
+            await github.rest.repos.createOrUpdateFileContents({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              path,
+              message: '[skip ci] Record temporary authorized-video transfer run',
+              content: Buffer.from(JSON.stringify(body, null, 2) + '\n').toString('base64'),
+              branch,
+              ...(sha ? {sha} : {}),
+            });
