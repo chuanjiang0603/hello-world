@@ -1,0 +1,58 @@
+name: Temporary authorized video 1080p
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-authorized-video-1080-ClPY7_mYcoo
+  cancel-in-progress: true
+
+jobs:
+  download-package-verify-1080:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+
+      - name: Build and run the verified 1080p variant
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import pathlib
+          import yaml
+
+          source = pathlib.Path('.github/workflows/tmp-authorized-video-final.yml')
+          data = yaml.safe_load(source.read_text(encoding='utf-8'))
+          steps = data['jobs']['download-package-verify']['steps']
+          script = next(step['run'] for step in steps if step.get('name') == 'Download authorized video through WARP and package for WeChat')
+          replacements = {
+              "FORMAT='bv[height<=720][ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a]/22/18/b[height<=720][ext=mp4]'": "FORMAT='137+140/bv[height=1080][ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a]'",
+              "OUT='output/Abbott_CGM_Usage_WeChat_720p.mp4'": "OUT='output/Abbott_CGM_Usage_WeChat_1080p.mp4'",
+              '"$WIDTH" -le 1280 && "$HEIGHT" -le 720': '"$WIDTH" -le 1920 && "$HEIGHT" -le 1080',
+              'selected 720p H.264/AAC stream': 'selected 1080p H.264/AAC stream',
+          }
+          for old, new in replacements.items():
+              if old not in script:
+                  raise SystemExit(f'Expected source fragment not found: {old}')
+              script = script.replace(old, new)
+          pathlib.Path('/tmp/run-authorized-video-1080.sh').write_text('set -euo pipefail\n' + script + '\n', encoding='utf-8')
+          PY
+          bash /tmp/run-authorized-video-1080.sh
+
+      - name: Upload verified 1080p video
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authorized-video-ClPY7_mYcoo-1080p
+          path: output/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 1
